@@ -17,6 +17,8 @@ from airflow.executors import DEFAULT_EXECUTOR
 from airflow.models import DagBag, TaskInstance, DagPickle, DagRun
 from airflow.utils import AirflowException, State
 
+from six.moves import zip
+
 DAGS_FOLDER = os.path.expanduser(configuration.get('core', 'DAGS_FOLDER'))
 
 # Common help text across subcommands
