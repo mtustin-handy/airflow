@@ -343,6 +343,12 @@ class SchedulerJob(BaseJob):
                 filename=filename, stacktrace=stacktrace))
         session.commit()
 
+    def _build_log_prefix(dag, **kwargs):
+        prefix = "Dag: {0} | ".format(dag.dag_id)
+        for key, value in kwargs.items():
+            prefix += "{0}: {1} | ".format(key, value)
+        return 
+
 
     def schedule_dag(self, dag):
         """
@@ -350,8 +356,14 @@ class SchedulerJob(BaseJob):
         for a DAG based on scheduling interval
         Returns DagRun if one is scheduled. Otherwise returns None.
         """
-        if dag.schedule_interval:
+        if not dag.schedule_interval:
+            logging.debug("{0}Not scheduling dag because "
+                          "it has no interval".format(
+                              self._build_log_prefix(dag)))
+        else:
             DagRun = models.DagRun
+            
+            # Figure number of active runs
             session = settings.Session()
             qry = session.query(func.count()).filter(
                 DagRun.dag_id == dag.dag_id,
@@ -360,13 +372,21 @@ class SchedulerJob(BaseJob):
             )
             active_runs = qry.scalar()
             if active_runs >= dag.max_active_runs:
+                logging.debug("{0}Not scheduling a dag run because "
+                              "current active runs exceed maximum".format(
+                    self._build_log_prefix(dag, active_runs=active_runs,
+                                           max_active_runs=dag.max_active_runs)))
                 return
+
+            # Figure out last scheduled run
             qry = session.query(func.max(DagRun.execution_date)).filter_by(
                     dag_id = dag.dag_id).filter(
                         or_(DagRun.external_trigger == False,
                             # add % as a wildcard for the like query
                             DagRun.run_id.like(DagRun.ID_PREFIX+'%')))
             last_scheduled_run = qry.scalar()
+
+            # set next run date based on last scheduled run
             next_run_date = None
             if not last_scheduled_run:
                 # First run
@@ -380,12 +400,33 @@ class SchedulerJob(BaseJob):
                     # Migrating from previous version
                     # make the past 5 runs active
                     next_run_date = dag.date_range(latest_run, -5)[0]
+                    logging.debug(
+                        "{0}Picking next_run_date from the fifth most "
+                        "recent execution date for a task".format(
+                             self._build_log_prefix(
+                                dag, latest_run=latest_run,
+                                next_run_date=next_run_date)))
                 else:
                     next_run_date = min([t.start_date for t in dag.tasks])
+                    logging.debug(
+                        "{0}Picking next_run_date from the earliest start date "
+                        "for tasks in the dag".format(
+                             self._build_log_prefix(
+                                 dag, next_run_date=next_run_date)))
             elif dag.schedule_interval != '@once':
                 next_run_date = dag.following_schedule(last_scheduled_run)
+                logging.debug(
+                        "{0}Picking next_run_date with "
+                        "dag.following_schedule(last_scheduled_run)".format(
+                             self._build_log_prefix(
+                                 dag, next_run_date=next_run_date,
+                                 last_scheduled_run=last_scheduled_run)))
             elif dag.schedule_interval == '@once' and not last_scheduled_run:
                 next_run_date = datetime.now()
+                logging.debug(
+                        "{0}next_run_date is right now for dag with @once schedule".format(
+                             self._build_log_prefix(
+                                 dag, next_run_date=next_run_date)))
 
             # this structure is necessary to avoid a TypeError from concatenating
             # NoneType
@@ -402,9 +443,21 @@ class SchedulerJob(BaseJob):
                     state=State.RUNNING,
                     external_trigger=False
                 )
+                logging.debug(
+                        "{0}Generating DagRun next_run for dag".format(
+                             self._build_log_prefix(dag, next_run=next_run)))
                 session.add(next_run)
                 session.commit()
                 return next_run
+            else:
+                logging.debug(
+                        "{0}Not generating DagRun because next_run_date is None"
+                        " or schedule_end is None or"
+                        " schedule_end is in the past".format(
+                             self._build_log_prefix(
+                                 dag, next_run_date=next_run_date,
+                                 schedule_end=schedule_end)))
+                return None
 
     def process_dag(self, dag, executor):
         """
@@ -429,16 +482,28 @@ class SchedulerJob(BaseJob):
         last_scheduler_run = db_dag.last_scheduler_run or datetime(2000, 1, 1)
         secs_since_last = (
             datetime.now() - last_scheduler_run).total_seconds()
-        # if db_dag.scheduler_lock or
+
         if secs_since_last < self.heartrate:
             session.commit()
             session.close()
+            logging.debug("{0}Not scheduling any tasks because the last run "
+                          "timestamp (last_scheduler_run) is fewer than "
+                          "self.heartrate seconds in the past".format(
+                             self._build_log_prefix(
+                                 dag, heartrate=self.heartrate,
+                                 last_scheduler_run=last_scheduler_run,
+                                 secs_since_last=secs_since_last)))
             return None
         else:
             # Taking a lock
             db_dag.scheduler_lock = True
             db_dag.last_scheduler_run = datetime.now()
             session.commit()
+            logging.debug("{0}Locking dag and setting last_scheduler_run"
+                          .format(
+                             self._build_log_prefix(
+                                 dag, last_scheduler_run=dag.last_scheduler_run,
+                                 )))
 
         active_runs = dag.get_active_runs()
 
@@ -455,24 +520,44 @@ class SchedulerJob(BaseJob):
             )
             skip_tis = {(ti[0], ti[1]) for ti in qry.all()}
 
-        descartes = [obj for obj in product(dag.tasks, active_runs)]
+        # descartes is the list of (task, run) pairs to check
+        # but those which are adhoc or in skip_tis will not be
+        # skip_tis should only include task instancs in a
+        # Running, Success, or Failure State.
+        # Queued instances are dealt with below after refresh
+        descartes = list(product(dag.tasks, active_runs))
         logging.info(
             'Checking dependencies on {} tasks instances, '
             'minus {} skippable ones'.format(len(descartes), len(skip_tis)))
+        logging.debug("{0}Skipping tis in skip_tis".format(
+            self._build_log_prefix(dag, skip_tis=skip_tis)))
         for task, dttm in descartes:
-            if task.adhoc or (task.task_id, dttm) in skip_tis:
+            in_skip_tis = (task.task_id, dttm) in skip_tis
+            if task.adhoc or in_skip_tis:
+                logging.debug("{0}Skipping ti because adhoc or in skip_tis"
+                              .format(self._build_log_prefix(
+                                dag,
+                                adhoc=task.adhoc,
+                                task_id=task.task_id,
+                                execution_date=dttm,
+                                in_skip_tis=in_skip_tis)))
                 continue
             ti = TI(task, dttm)
             ti.refresh_from_db()
             if ti.state in (
                     State.RUNNING, State.QUEUED, State.SUCCESS, State.FAILED):
+                logging.debug("{0}Skipping ti because in running, success, "
+                              "queued, or failure state".format(
+                                  self._build_log_prefix(
+                                    dag, ti=ti, state=ti.state)))
                 continue
             elif ti.is_runnable(flag_upstream_failed=True):
-                logging.debug('Firing task: {}'.format(ti))
+                logging.debug('Queuing task: {}'.format(ti))
                 executor.queue_task_instance(ti, pickle_id=pickle_id)
 
         # Releasing the lock
-        logging.debug("Unlocking DAG (scheduler_lock)")
+        logging.debug("{0}Unlocking DAG (scheduler_lock)".format(
+            self._build_log_prefix(dag)))
         db_dag = (
             session.query(DagModel)
             .filter(DagModel.dag_id == dag.dag_id)
@@ -488,7 +573,9 @@ class SchedulerJob(BaseJob):
     def prioritize_queued(self, session, executor, dagbag):
         # Prioritizing queued task instances
 
-        pools = {p.pool: p for p in session.query(models.Pool).all()}
+        # As written, this will ignore pool objects p if a later
+        # p has the same p.pool property. Correct behaviour?
+        pools = {p.pool:p for p in session.query(models.Pool).all()}
         TI = models.TaskInstance
         queued_tis = (
             session.query(TI)
@@ -500,11 +587,11 @@ class SchedulerJob(BaseJob):
         d = defaultdict(list)
         for ti in queued_tis:
             if ti.dag_id not in dagbag.dags:
-                logging.info("DAG not longer in dagbag, deleting {}".format(ti))
+                logging.info("DAG no longer in dagbag, deleting {}".format(ti))
                 session.delete(ti)
                 session.commit()
             elif not dagbag.dags[ti.dag_id].has_task(ti.task_id):
-                logging.info("Task not longer exists, deleting {}".format(ti))
+                logging.info("Task no longer exists, deleting {}".format(ti))
                 session.delete(ti)
                 session.commit()
             else:
@@ -514,7 +601,7 @@ class SchedulerJob(BaseJob):
         for pool, tis in list(d.items()):
             if not pool:
                 # Arbitrary:
-                # If queued outside of a pool, trigger no more than 32 per run
+                # If queued outside of a pool, trigger no more than 128 per run
                 open_slots = 128
             else:
                 open_slots = pools[pool].open_slots(session=session)
@@ -524,10 +611,13 @@ class SchedulerJob(BaseJob):
                 "Pool {pool} has {open_slots} slots, "
                 "{queue_size} task instances in queue".format(**locals()))
             if not open_slots:
+                logging.debug("Skipping pool because it has no open slots")
                 continue
             tis = sorted(
                 tis, key=lambda ti: (-ti.priority_weight, ti.start_date))
             for ti in tis:
+                # should not be possible, as open_slots is not updated between
+                # here and last check for open_slots
                 if not open_slots:
                     continue
                 task = None
@@ -540,6 +630,9 @@ class SchedulerJob(BaseJob):
                     continue
 
                 if not task:
+                    logging.debug(("{0}Skipping ti because no task could be"
+                                  " retrieved").format(self._build_log_prefix(
+                                      ti.dag_id, ti=ti, task_id=ti.task_id)))
                     continue
 
                 ti.task = task
@@ -554,16 +647,23 @@ class SchedulerJob(BaseJob):
                     pickle_id = dag.pickle(session).id
 
                 if dag.dag_id in overloaded_dags or dag.concurrency_reached:
+                    logging.debug("{0}Not attempting to send tasks to executor "
+                                  "for dag as concurrency maxed out".format(
+                                      self._build_log_prefix(dag)))
                     overloaded_dags.add(dag.dag_id)
                     continue
                 if ti.are_dependencies_met():
                     executor.queue_task_instance(
                         ti, force=True, pickle_id=pickle_id)
+                    logging.debug("{0}Sending task to executor".format(
+                        self._build_log_prefix(dag, ti=ti)))
                     open_slots -= 1
                 else:
                     session.delete(ti)
+                    logging.debug("{0}Not sending task to executor".format(
+                        self._build_log_prefix(dag, ti=ti)))
                     continue
-                ti.task = task
+                 ti.task = task
 
                 session.commit()
 
@@ -593,6 +693,10 @@ class SchedulerJob(BaseJob):
                     logging.exception(e)
 
                 i += 1
+                
+                if self.num_runs:
+                    logging.debug("Scheduler run {} of {}".format(i, self.num_runs))
+
                 try:
                     if i % self.refresh_dags_every == 0:
                         dagbag = models.DagBag(self.subdir, sync_to_db=True)
@@ -607,17 +711,30 @@ class SchedulerJob(BaseJob):
                 if dag_id:
                     dags = [dagbag.dags[dag_id]]
                 else:
-                    dags = [
-                        dag for dag in dagbag.dags.values() if not dag.parent_dag]
+                    # don't try to schedule subdags
+                    # Todo: add testing around dags in separate modules.
+                    dags = [dag for dag in dagbag.dags.values()
+                            if not dag.parent_dag]
                 paused_dag_ids = dagbag.paused_dags()
                 for dag in dags:
                     logging.debug("Scheduling {}".format(dag.dag_id))
                     dag = dagbag.get_dag(dag.dag_id)
                     if not dag or (dag.dag_id in paused_dag_ids):
+                        logging.debug("{0}Not scheduling dag because it is None"
+                                      " or is paused".format(
+                                          self._build_log_prefix(dag,
+                                                                 is_paused=(
+                                        dag and dag.dag_id in paused_dag_ids))))
                         continue
                     try:
+                        logging.debug("{0}Sending dag to schedule_dag".format(
+                            self._build_log_prefix(dag)))
                         self.schedule_dag(dag)
+                        logging.debug("{0}Sending dag to process_dag".format(
+                            self._build_log_prefix(dag)))
                         self.process_dag(dag, executor)
+                        logging.debug("{0}Sending dag to manage_slas".format(
+                            self._build_log_prefix(dag)))
                         self.manage_slas(dag)
                     except Exception as e:
                         logging.exception(e)
@@ -642,6 +759,9 @@ class SchedulerJob(BaseJob):
                     logging.error("Tachycardia!")
             except Exception as deep_e:
                 logging.exception(deep_e)
+
+        if self.num_runs and i >= self.num_runs:
+            logging.info("Max runs exceeded")
         executor.end()
 
     def heartbeat_callback(self):
