@@ -918,7 +918,7 @@ class TaskInstance(Base):
         elif not ignore_dependencies and \
                 not self.are_dependencies_met(session):
             logging.warning("Dependencies not met yet")
-        elif self.state == State.UP_FOR_RETRY and \
+        elif not force and self.state == State.UP_FOR_RETRY and \
                 not self.ready_for_retry():
             next_run = (self.end_date + task.retry_delay).isoformat()
             logging.info(
